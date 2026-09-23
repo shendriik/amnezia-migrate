@@ -5,6 +5,7 @@ The resulting archive contains private VPN keys. Never commit it to Git.
 """
 
 import argparse
+from contextlib import contextmanager
 import datetime as dt
 import gzip
 import hashlib
@@ -24,28 +25,44 @@ class ExportError(Exception):
     pass
 
 
-def ssh_command(host: str, args: list[str]) -> list[str]:
-    # OpenSSH still verifies host keys using the caller's normal SSH settings.
-    return ["ssh", "-T", host, shlex.join(args)]
+@contextmanager
+def ssh_session(host: str):
+    # Reuse the first authenticated SSH connection. With password login this
+    # avoids prompting again for every inspect, commit and image transfer.
+    with tempfile.TemporaryDirectory(prefix="amnezia-ssh-") as directory:
+        socket_path = str(Path(directory) / "socket")
+        options = ["-o", f"ControlPath={socket_path}", "-o", "ControlMaster=auto",
+                   "-o", "ControlPersist=60"]
+
+        def command(args: list[str]) -> list[str]:
+            # Normal host-key verification remains enabled.
+            return ["ssh", "-T", *options, host, shlex.join(args)]
+
+        try:
+            yield command
+        finally:
+            subprocess.run(["ssh", "-S", socket_path, "-O", "exit", host],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def remote(host: str, *args: str) -> str:
-    result = subprocess.run(ssh_command(host, list(args)), text=True,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def remote(command, *args: str) -> str:
+    # stderr stays on the terminal so OpenSSH can show a password prompt.
+    result = subprocess.run(command(list(args)), text=True,
+                            stdout=subprocess.PIPE)
     if result.returncode:
-        raise ExportError(f"Remote command failed ({shlex.join(args)}):\n{result.stderr.strip()}")
+        raise ExportError(f"Remote command failed ({shlex.join(args)}), exit {result.returncode}")
     return result.stdout.strip()
 
 
-def remote_json(host: str, *args: str):
+def remote_json(command, *args: str):
     try:
-        return json.loads(remote(host, *args))
+        return json.loads(remote(command, *args))
     except json.JSONDecodeError as exc:
         raise ExportError(f"Invalid JSON from remote command: {shlex.join(args)}") from exc
 
 
-def check_source(host: str, container: str) -> dict:
-    info = remote_json(host, "docker", "inspect", container)[0]
+def check_source(command, container: str) -> dict:
+    info = remote_json(command, "docker", "inspect", container)[0]
     if not info.get("State", {}).get("Running"):
         raise ExportError(f"Container {container} is not running")
     mounts = info.get("Mounts", [])
@@ -59,7 +76,7 @@ def check_source(host: str, container: str) -> dict:
                           "Exporting its image alone would lose data; no archive was created.")
     for filename in ("awg0.conf", "clientsTable", "wireguard_server_private_key.key",
                      "wireguard_server_public_key.key", "wireguard_psk.key"):
-        remote(host, "docker", "exec", container, "test", "-s",
+        remote(command, "docker", "exec", container, "test", "-s",
                f"/opt/amnezia/awg/{filename}")
     hc = info["HostConfig"]
     if hc.get("NetworkMode") != "bridge":
@@ -71,7 +88,7 @@ def check_source(host: str, container: str) -> dict:
     for name, attachment in (info.get("NetworkSettings", {}).get("Networks") or {}).items():
         if name == "bridge":
             continue
-        definition = remote_json(host, "docker", "network", "inspect", name)[0]
+        definition = remote_json(command, "docker", "network", "inspect", name)[0]
         if definition.get("Driver") != "bridge":
             raise ExportError(f"Unsupported network driver for {name}")
         networks[name] = {
@@ -100,20 +117,18 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def save_remote_image(host: str, tag: str, path: Path) -> None:
+def save_remote_image(command, tag: str, path: Path) -> None:
     # docker save is a binary tar stream. gzip runs locally, so SSH stdout stays binary-clean.
     with path.open("wb") as target:
-        process = subprocess.Popen(ssh_command(host, ["docker", "image", "save", tag]),
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(command(["docker", "image", "save", tag]),
+                                   stdout=subprocess.PIPE)
         assert process.stdout is not None
-        assert process.stderr is not None
         try:
             with gzip.GzipFile(fileobj=target, mode="wb", mtime=0) as packed:
                 shutil.copyfileobj(process.stdout, packed, 1024 * 1024)
             process.stdout.close()
-            error = process.stderr.read().decode("utf-8", errors="replace")
             if process.wait() != 0:
-                raise ExportError(f"Could not download Docker image: {error.strip()}")
+                raise ExportError("Could not download Docker image; see SSH error above")
             target.flush()
             os.fsync(target.fileno())
         finally:
@@ -127,47 +142,48 @@ def export(host: str, destination: Path, container: str) -> None:
         raise ExportError(f"Output directory does not exist: {destination.parent}")
     if destination.exists():
         raise ExportError(f"Refusing to overwrite existing file: {destination}")
-    config = check_source(host, container)
     tag = f"amnezia-migrate:export-{uuid.uuid4().hex[:12]}"
     os.umask(0o077)
-    print(f"Creating snapshot of {container} on {host}...", flush=True)
-    committed = False
-    try:
-        remote(host, "docker", "commit", container, tag)
-        committed = True
-        image = remote_json(host, "docker", "image", "inspect", tag)[0]
-        with tempfile.TemporaryDirectory(prefix="amnezia-export-", dir=destination.parent) as tmp:
-            image_path = Path(tmp) / "image.tar.gz"
-            print("Downloading image over SSH...", flush=True)
-            save_remote_image(host, tag, image_path)
-            manifest = {
-                "schema_version": 1,
-                "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "image_tag": tag,
-                "image_architecture": image["Architecture"],
-                "image_os": image["Os"],
-                "image_sha256": sha256(image_path),
-                "image_size": image_path.stat().st_size,
-                "container": config,
-            }
-            manifest_path = Path(tmp) / "manifest.json"
-            manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
-            partial = Path(tmp) / "package.tar.gz"
-            with tarfile.open(partial, "w:gz") as archive:
-                archive.add(manifest_path, arcname="manifest.json")
-                archive.add(image_path, arcname="image.tar.gz")
-            # On the same filesystem, rename makes the completed archive visible atomically.
-            if destination.exists():
-                raise ExportError(f"Output appeared during export: {destination}")
-            os.replace(partial, destination)
-            destination.chmod(0o600)
-    finally:
-        if committed:
-            try:
-                remote(host, "docker", "image", "rm", tag)
-            except ExportError as exc:
-                print(f"Warning: temporary image {tag} remains on the VPS: {exc}",
-                      file=sys.stderr)
+    with ssh_session(host) as command:
+        config = check_source(command, container)
+        print(f"Creating snapshot of {container} on {host}...", flush=True)
+        committed = False
+        try:
+            remote(command, "docker", "commit", container, tag)
+            committed = True
+            image = remote_json(command, "docker", "image", "inspect", tag)[0]
+            with tempfile.TemporaryDirectory(prefix="amnezia-export-", dir=destination.parent) as tmp:
+                image_path = Path(tmp) / "image.tar.gz"
+                print("Downloading image over SSH...", flush=True)
+                save_remote_image(command, tag, image_path)
+                manifest = {
+                    "schema_version": 1,
+                    "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                    "image_tag": tag,
+                    "image_architecture": image["Architecture"],
+                    "image_os": image["Os"],
+                    "image_sha256": sha256(image_path),
+                    "image_size": image_path.stat().st_size,
+                    "container": config,
+                }
+                manifest_path = Path(tmp) / "manifest.json"
+                manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+                partial = Path(tmp) / "package.tar.gz"
+                with tarfile.open(partial, "w:gz") as archive:
+                    archive.add(manifest_path, arcname="manifest.json")
+                    archive.add(image_path, arcname="image.tar.gz")
+                # On the same filesystem, rename makes the completed archive visible atomically.
+                if destination.exists():
+                    raise ExportError(f"Output appeared during export: {destination}")
+                os.replace(partial, destination)
+                destination.chmod(0o600)
+        finally:
+            if committed:
+                try:
+                    remote(command, "docker", "image", "rm", tag)
+                except ExportError as exc:
+                    print(f"Warning: temporary image {tag} remains on the VPS: {exc}",
+                          file=sys.stderr)
     print(f"Saved: {destination} ({destination.stat().st_size:,} bytes)")
     print("Contains VPN private keys. Keep the archive private; never upload it to GitHub.")
 
