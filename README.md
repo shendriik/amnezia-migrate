@@ -12,7 +12,7 @@ of `/lib/modules` is supported. This matches the installation described during
 development; other Amnezia protocols and volume layouts are not yet supported.
 
 ```bash
-python3 amnezia_migrate.py export root@dusnet.duckdns.org ~/amnezia-backup.tar.gz
+python3 amnezia_migrate.py export root@old-vps.example.com ~/amnezia-backup.tar.gz
 ```
 
 The command checks server files and mounts, creates a Docker snapshot, downloads
