@@ -188,18 +188,182 @@ def export(host: str, destination: Path, container: str) -> None:
     print("Contains VPN private keys. Keep the archive private; never upload it to GitHub.")
 
 
+def read_backup(archive_path: Path, directory: Path) -> tuple[dict, Path]:
+    """Read only the two expected regular files and verify the image stream."""
+    image_path = directory / "image.tar.gz"
+    with tarfile.open(archive_path, "r:gz") as archive:
+        members = archive.getmembers()
+        if sorted(m.name for m in members) != ["image.tar.gz", "manifest.json"] or any(
+            not m.isfile() for m in members
+        ):
+            raise ExportError("Archive must contain only regular manifest.json and image.tar.gz files")
+        manifest_member = next(m for m in members if m.name == "manifest.json")
+        if manifest_member.size > 1024 * 1024:
+            raise ExportError("Manifest is too large")
+        manifest = json.load(archive.extractfile(manifest_member))
+        image_member = next(m for m in members if m.name == "image.tar.gz")
+        digest = hashlib.sha256()
+        size = 0
+        with archive.extractfile(image_member) as source, image_path.open("wb") as target:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                target.write(block)
+                digest.update(block)
+                size += len(block)
+    if manifest.get("schema_version") != 1 or manifest.get("image_sha256") != digest.hexdigest() or manifest.get("image_size") != size:
+        raise ExportError("Unsupported archive format or image checksum mismatch")
+    config = manifest.get("container")
+    if not isinstance(config, dict) or config.get("container_name") != "amnezia-awg2":
+        raise ExportError("This importer supports only amnezia-awg2")
+    if manifest.get("image_os") != "linux" or manifest.get("image_architecture") != "amd64":
+        raise ExportError("Only Linux amd64 images are supported")
+    tag = manifest.get("image_tag")
+    if not isinstance(tag, str) or not tag.startswith("amnezia-migrate:export-") or not tag.split("-")[-1].isalnum():
+        raise ExportError("Invalid image tag in archive")
+    ports = config.get("port_bindings")
+    if not isinstance(ports, dict) or not ports or any(
+        not key.endswith("/udp") or not key[:-4].isdigit() or not isinstance(values, list)
+        or not values or any(not isinstance(value, dict)
+                             or value.get("HostIp", "") not in ("", "0.0.0.0")
+                             or not str(value.get("HostPort", "")).isdigit()
+                             for value in values)
+        for key, values in ports.items()
+    ):
+        raise ExportError("Invalid UDP port bindings in manifest")
+    if any(m != {"source": "/lib/modules", "destination": "/lib/modules"}
+           for m in config.get("mounts", [])):
+        raise ExportError("Unsupported mount in manifest")
+    return manifest, image_path
+
+
+def install_docker(command) -> None:
+    # Use Docker's official apt repository for a clean Debian/Ubuntu host.
+    script = """set -eu
+. /etc/os-release
+case "$ID" in ubuntu|debian) ;; *) echo 'Docker installer requires Ubuntu or Debian' >&2; exit 1;; esac
+command -v apt-get >/dev/null
+apt-get update
+apt-get install -y ca-certificates curl
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL "https://download.docker.com/linux/$ID/gpg" -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+ARCH=$(dpkg --print-architecture)
+printf 'Types: deb\nURIs: https://download.docker.com/linux/%s\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' "$ID" "${UBUNTU_CODENAME:-${VERSION_CODENAME}}" "$ARCH" > /etc/apt/sources.list.d/docker.sources
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl enable --now docker
+"""
+    remote(command, "sh", "-c", script)
+
+
+def restore_networks(command, networks: dict) -> None:
+    for name, definition in networks.items():
+        if not name or name in ("bridge", "host", "none") or not all(
+            ch.isalnum() or ch in "_.-" for ch in name
+        ):
+            raise ExportError("Invalid custom Docker network name")
+        ipam = definition.get("ipam") or []
+        if definition.get("driver") != "bridge" or not isinstance(ipam, list):
+            raise ExportError(f"Unsupported network configuration: {name}")
+        existing = subprocess.run(command(["docker", "network", "inspect", name]),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if existing.returncode == 0:
+            current = remote_json(command, "docker", "network", "inspect", name)[0]
+            if current.get("Driver") != "bridge" or (current.get("IPAM") or {}).get("Config") != ipam:
+                raise ExportError(f"Existing network {name} differs from backup")
+        else:
+            args = ["docker", "network", "create", "--driver", "bridge"]
+            for address in ipam:
+                for key, option in (("Subnet", "--subnet"), ("Gateway", "--gateway"),
+                                    ("IPRange", "--ip-range")):
+                    if address.get(key):
+                        args.extend([option, address[key]])
+            remote(command, *args, name)
+
+
+def import_backup(archive_path: Path, host: str) -> None:
+    if not archive_path.is_file():
+        raise ExportError(f"Archive does not exist: {archive_path}")
+    os.umask(0o077)
+    with tempfile.TemporaryDirectory(prefix="amnezia-import-") as directory:
+        manifest, image_path = read_backup(archive_path, Path(directory))
+        config = manifest["container"]
+        with ssh_session(host) as command:
+            if remote(command, "id", "-u") != "0":
+                raise ExportError("SSH user must be root (use root@server)")
+            if remote(command, "uname", "-m") != "x86_64":
+                raise ExportError("Target must be x86_64")
+            found = subprocess.run(command(["sh", "-c", "command -v docker"]),
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if found.returncode:
+                print("Installing Docker on target...", flush=True)
+                install_docker(command)
+            else:
+                remote(command, "systemctl", "start", "docker")
+            remote(command, "docker", "info", "--format", "{{.ServerVersion}}")
+            existing = subprocess.run(command(["docker", "container", "inspect", "amnezia-awg2"]),
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if existing.returncode == 0:
+                raise ExportError("Target already has an amnezia-awg2 container; nothing was restored")
+            print("Uploading Docker image over SSH...", flush=True)
+            with image_path.open("rb") as source:
+                result = subprocess.run(command(["docker", "image", "load"]), stdin=source)
+            if result.returncode:
+                raise ExportError("Docker could not load the saved image")
+            networks = config.get("networks") or {}
+            restore_networks(command, networks)
+            args = ["docker", "create", "--name", "amnezia-awg2", "--network", "bridge"]
+            if config.get("privileged"):
+                args.append("--privileged")
+            for capability in config.get("cap_add") or []:
+                args.extend(["--cap-add", capability])
+            for key, value in (config.get("sysctls") or {}).items():
+                args.extend(["--sysctl", f"{key}={value}"])
+            restart = (config.get("restart_policy") or {}).get("Name", "no")
+            if restart not in ("no", "always", "unless-stopped", "on-failure"):
+                raise ExportError(f"Unsupported restart policy: {restart}")
+            args.extend(["--restart", restart])
+            if config.get("log_driver"):
+                args.extend(["--log-driver", config["log_driver"]])
+            for container_port, bindings in config["port_bindings"].items():
+                for binding in bindings:
+                    args.extend(["-p", f"{binding['HostPort']}:{container_port}"])
+            for mount in config.get("mounts") or []:
+                args.extend(["-v", f"{mount['source']}:{mount['destination']}"])
+            remote(command, *args, manifest["image_tag"])
+            for name, definition in networks.items():
+                connect = ["docker", "network", "connect"]
+                if definition.get("ipv4_address"):
+                    connect.extend(["--ip", definition["ipv4_address"]])
+                remote(command, *connect, name, "amnezia-awg2")
+            remote(command, "docker", "start", "amnezia-awg2")
+            if remote(command, "docker", "inspect", "--format", "{{.State.Running}}", "amnezia-awg2") != "true":
+                raise ExportError("Restored container failed to start")
+            for filename in ("awg0.conf", "clientsTable", "wireguard_server_private_key.key",
+                             "wireguard_server_public_key.key", "wireguard_psk.key"):
+                remote(command, "docker", "exec", "amnezia-awg2", "test", "-s",
+                       f"/opt/amnezia/awg/{filename}")
+    print("Import complete. Check the UDP firewall and update DuckDNS to the new VPS IP when ready.")
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Export an AmneziaWG VPS to one local archive")
+    parser = argparse.ArgumentParser(description="Export or import an AmneziaWG VPS via SSH")
     subparsers = parser.add_subparsers(dest="action", required=True)
     command = subparsers.add_parser("export", help="Snapshot and download the server")
     command.add_argument("host", help="SSH destination, e.g. root@old-vps.example.com")
     command.add_argument("output", type=Path, help="Local .tar.gz output file")
     command.add_argument("--container", default="amnezia-awg2", help="Container name")
+    command = subparsers.add_parser("import", help="Restore archive to a fresh VPS")
+    command.add_argument("archive", type=Path, help="Local archive from export")
+    command.add_argument("host", help="SSH destination, e.g. root@new-vps.example.com")
     args = parser.parse_args()
     try:
-        export(args.host, args.output.expanduser().absolute(), args.container)
-    except (ExportError, OSError, KeyError, IndexError) as exc:
-        print(f"Export failed: {exc}", file=sys.stderr)
+        if args.action == "export":
+            export(args.host, args.output.expanduser().absolute(), args.container)
+        else:
+            import_backup(args.archive.expanduser().absolute(), args.host)
+    except (ExportError, OSError, KeyError, IndexError, ValueError, tarfile.TarError,
+            json.JSONDecodeError) as exc:
+        print(f"{args.action.capitalize()} failed: {exc}", file=sys.stderr)
         return 1
     return 0
 
