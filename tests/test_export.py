@@ -16,7 +16,12 @@ FAKE_SSH = r'''#!/usr/bin/env python3
 import json, os, shlex, sys
 from pathlib import Path
 
-command = shlex.split(sys.argv[3])
+if "-O" in sys.argv:
+    sys.exit(0)
+command = shlex.split(sys.argv[-1])
+if "ControlMaster=auto" not in sys.argv:
+    print("Missing connection reuse", file=sys.stderr)
+    sys.exit(2)
 with Path(os.environ["FAKE_LOG"]).open("a") as log:
     log.write(json.dumps(command) + "\n")
 if command[:2] == ["docker", "inspect"]:
