@@ -10,9 +10,10 @@ to run Docker on the VPS. The SSH host key must already be trusted. The VPS
 must have a running `amnezia-awg2` container with no data volumes. A bind mount
 of `/lib/modules` is supported. This matches the installation described during
 development; other Amnezia protocols and volume layouts are not yet supported.
+The script reuses one SSH connection, so password authentication prompts once.
 
 ```bash
-python3 amnezia_migrate.py export root@old-vps.example.com ~/amnezia-backup.tar.gz
+python3 amnezia_migrate.py export root@dusnet.duckdns.org ~/amnezia-backup.tar.gz
 ```
 
 The command checks server files and mounts, creates a Docker snapshot, downloads
